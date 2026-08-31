@@ -2,6 +2,7 @@
 
 #include <CGAL/Surface_mesh_simplification/Edge_collapse_visitor_base.h>
 #include "common.h"
+#include "pinned_vertex.h"
 
 namespace vr_tokenizer::cgal
 {
@@ -15,7 +16,8 @@ namespace vr_tokenizer::cgal
 
     struct StatsVisitor : SMS::Edge_collapse_visitor_base<Surface_mesh>
     {
-        StatsVisitor(Stats *stats, const Surface_mesh &mesh, const bool &record_full_info);
+        StatsVisitor(Stats *stats, const Surface_mesh &mesh, const bool &record_full_info,
+                     Pin_map *pins = nullptr);
 
         void OnCollected(const Profile &, const opt::optional<double> &)
         {
@@ -43,6 +45,8 @@ namespace vr_tokenizer::cgal
         Stats *stats;
         const Surface_mesh &mesh;
         const bool record_full_info;
+        // Pins migrate to the surviving vertex after each collapse; see OnCollapsed.
+        Pin_map *pins;
     };
 
 } // namespace vr_tokenizer::cgal

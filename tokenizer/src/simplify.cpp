@@ -2,9 +2,13 @@
 #include <CGAL/Surface_mesh_simplification/Policies/Edge_collapse/Bounded_normal_change_placement.h>
 #include <CGAL/Surface_mesh_simplification/Policies/Edge_collapse/Constrained_placement.h>
 #include <CGAL/Unique_hash_map.h>
+#include <array>
+#include <map>
+#include <vector>
 #include "common.h"
 #include "garland_heckbert_no_placement.h"
 #include "mesh.h"
+#include "pinned_vertex.h"
 #include "simplify.h"
 #include "simplify_stop_predicate.h"
 #include "visitor.h"
@@ -50,6 +54,43 @@ namespace vr_tokenizer::cgal
     return get(CGAL::vertex_point, sm, vd);
   }
 
+  // Resolve indices into the *input* vertex array to descriptors in the cleaned
+  // mesh. polygon_soup_to_mesh runs repair_polygon_soup / orient_polygon_soup,
+  // which may merge and reorder vertices, so indices cannot be carried across --
+  // but the coordinates are quantized integers held in doubles, so exact point
+  // equality is a sound way back. Returns the number resolved.
+  std::size_t resolve_pins(
+      const ArrayX3d &vertices,
+      const std::vector<int> &pinned_vertices,
+      const Surface_mesh &mesh,
+      Pin_map &pins)
+  {
+    if (pinned_vertices.empty())
+      return 0;
+
+    std::map<std::array<double, 3>, std::size_t> wanted;
+    for (int idx : pinned_vertices)
+    {
+      if (idx < 0 || idx >= vertices.rows())
+        continue;
+      wanted[{vertices(idx, 0), vertices(idx, 1), vertices(idx, 2)}] = 0;
+    }
+
+    std::size_t found = 0;
+    for (vertex_descriptor vd : mesh.vertices())
+    {
+      const Point_3 &p = point(vd, mesh);
+      auto it = wanted.find({p.x(), p.y(), p.z()});
+      if (it != wanted.end() && it->second == 0)
+      {
+        pins[vd] = true;
+        it->second = 1;
+        ++found;
+      }
+    }
+    return found;
+  }
+
   template <typename GH_policies>
   Stats edge_collapse_with_record_impl(
       const ArrayX3d &vertices,
@@ -58,7 +99,8 @@ namespace vr_tokenizer::cgal
       std::size_t target_number_of_triangles,
       double sharp_angle_threshold,
       bool strict,
-      bool record_full_info)
+      bool record_full_info,
+      const std::vector<int> &pinned_vertices)
   {
     Stats stats;
     auto mesh_opt = polygon_soup_to_mesh(vertices, faces, strict, true);
@@ -83,8 +125,6 @@ namespace vr_tokenizer::cgal
     using GH_placement = typename GH_policies::Get_placement;
     using Bounded_GH_placement = SMS::Bounded_normal_change_placement<GH_placement>;
 
-    StatsVisitor vis(&stats, mesh, record_full_info);
-
     GH_policies gh_policies(mesh);
     const GH_cost &gh_cost = gh_policies.get_cost();
     const GH_placement &gh_placement = gh_policies.get_placement();
@@ -93,10 +133,24 @@ namespace vr_tokenizer::cgal
     // Possibly constraint the sharp features
     CGAL::Unique_hash_map<edge_descriptor, bool> constraint_hmap(false);
     Constrained_edge_map constraints_map(constraint_hmap);
-    SMS::Constrained_placement<Bounded_GH_placement, Constrained_edge_map> constrained_placement(constraints_map, bounded_gh_placement);
+
+    // Vertices the caller asked to keep (empty => unchanged upstream behaviour).
+    Pin_map pin_hmap(false);
+    stats.num_pinned = resolve_pins(vertices, pinned_vertices, mesh, pin_hmap);
+    const Pin_map *pins = pinned_vertices.empty() ? nullptr : &pin_hmap;
+
+    // One static placement type, always. 
+    using Constrained_GH_placement =
+        SMS::Constrained_placement<Bounded_GH_placement, Constrained_edge_map>;
+    using Pinned_GH_placement = Pinned_vertex_placement<Constrained_GH_placement>;
+
+    Constrained_GH_placement constrained_placement(constraints_map, bounded_gh_placement);
+    Pinned_GH_placement placement(pins, constrained_placement);
+    Pinned_vertex_filter pin_filter{pins};
+
+    StatsVisitor vis(&stats, mesh, record_full_info, pins == nullptr ? nullptr : &pin_hmap);
 
     bool detect_sharp_edges = sharp_angle_threshold > 0;
-    auto placement = detect_sharp_edges ? constrained_placement : bounded_gh_placement;
     if (detect_sharp_edges)
     {
       // detect sharp edges
@@ -130,7 +184,8 @@ namespace vr_tokenizer::cgal
         CGAL::parameters::visitor(vis)
             .edge_is_constrained_map(constraints_map)
             .get_cost(gh_cost)
-            .get_placement(placement));
+            .get_placement(placement)
+            .filter(pin_filter));
 
     return stats;
   }
@@ -143,7 +198,8 @@ namespace vr_tokenizer::cgal
       bool no_placement,
       double sharp_angle_threshold,
       bool strict,
-      bool record_full_info)
+      bool record_full_info,
+      const std::vector<int> &pinned_vertices)
   {
     if (no_placement)
     {
@@ -154,7 +210,8 @@ namespace vr_tokenizer::cgal
           target_number_of_triangles,
           sharp_angle_threshold,
           strict,
-          record_full_info);
+          record_full_info,
+          pinned_vertices);
     }
     else
     {
@@ -165,7 +222,8 @@ namespace vr_tokenizer::cgal
           target_number_of_triangles,
           sharp_angle_threshold,
           strict,
-          record_full_info);
+          record_full_info,
+          pinned_vertices);
     }
   }
 

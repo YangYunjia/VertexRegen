@@ -14,8 +14,8 @@ namespace vr_tokenizer::cgal
 
 #define TAG CGAL::Parallel_if_available_tag
 
-    StatsVisitor::StatsVisitor(Stats *s, const Surface_mesh &m, const bool &r)
-        : stats(s), mesh(m), record_full_info(r)
+    StatsVisitor::StatsVisitor(Stats *s, const Surface_mesh &m, const bool &r, Pin_map *p)
+        : stats(s), mesh(m), record_full_info(r), pins(p)
     {
     }
 
@@ -45,9 +45,22 @@ namespace vr_tokenizer::cgal
         stats->collapse_sequence.emplace_back(info);
     }
 
-    void StatsVisitor::OnCollapsed(const Profile &profile, const vertex_descriptor &)
+    void StatsVisitor::OnCollapsed(const Profile &profile, const vertex_descriptor &vd)
     {
         ++(stats->collapsed);
+        // Migrate the pin to the survivor.
+        //
+        // Euler::collapse_edge always erases `source` and never flips the halfedge
+        // to spare a particular vertex, so a pinned endpoint can be the one
+        // removed. Pinned_vertex_placement has already parked the survivor on the
+        // pinned point, but without this the survivor carries the pinned *position*
+        // and no pin -- and the next collapse touching it is free to move it away.
+        // Measured before this line existed: only 4-6 of 8 corners reached the
+        // base mesh.
+        if (pins != nullptr && (pins->is_defined(profile.v0()) || pins->is_defined(profile.v1())))
+        {
+            (*pins)[vd] = true;
+        }
         if (record_full_info)
         {
             auto &info = stats->collapse_sequence.back();

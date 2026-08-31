@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <optional>
+#include <vector>
 #include "common.h"
 
 namespace vr_tokenizer::cgal
@@ -15,7 +16,10 @@ namespace vr_tokenizer::cgal
         bool no_placement = false,
         double sharp_angle_threshold = -1,
         bool strict = false,
-        bool record_full_info = false);
+        bool record_full_info = false,
+        // Indices into `vertices` that must survive the simplification.
+        // Empty (the default) reproduces upstream behaviour exactly.
+        const std::vector<int> &pinned_vertices = {});
 
     std::optional<PolygonSoup> vertex_split(
         const Eigen::ArrayX3d &vertices,

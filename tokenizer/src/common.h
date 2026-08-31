@@ -50,6 +50,7 @@ namespace vr_tokenizer::cgal
         size_t cost_uncomputable = 0;
         size_t placement_uncomputable = 0;
         size_t num_sharp_edges = 0;
+        size_t num_pinned = 0;
         std::vector<CollapseInfo> collapse_sequence;
     };
 

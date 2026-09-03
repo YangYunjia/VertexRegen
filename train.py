@@ -7,6 +7,7 @@ from accelerate.logging import get_logger
 from omegaconf import OmegaConf
 from vertexregen.modeling import get_model
 from vertexregen.config import DataConfig, ModelConfig
+from transformers import EarlyStoppingCallback
 from vertexregen.misc import JsonlLoggerCallback, get_last_checkpoint
 from vertexregen.data import get_dataset, VertexRegenTokenizer, VertexRegenCollator
 
@@ -43,6 +44,19 @@ def main(cfg):
         model = get_model(model_cfg)
         train_set, val_set = get_dataset(data_cfg)
 
+    # The quantisation frame lives in the DATASET's encode_meta.json. Copy it in beside the weights.
+    try:
+        import os as _os, shutil as _sh
+        _src = _os.path.join(str(cfg.data.path), "encode_meta.json")
+        _dst = _os.path.join(str(cfg.train.train_args.output_dir), "encode_meta.json")
+        _os.makedirs(_os.path.dirname(_dst), exist_ok=True)
+        if _os.path.isfile(_src):
+            _sh.copy2(_src, _dst); accelerator.print(f"[frame] persisted -> {_dst}")
+        else:
+            accelerator.print(f"[frame] WARNING: {_src} missing; outputs undecodable")
+    except Exception as _e:  # noqa: BLE001
+        accelerator.print(f"[frame] WARNING: could not persist encode_meta.json: {_e}")
+
     trainer = SFTTrainer(
         model=model,
         args=train_args,
@@ -50,7 +64,19 @@ def main(cfg):
         eval_dataset=val_set,
         data_collator=VertexRegenCollator(data_cfg, model_cfg),
         processing_class=VertexRegenTokenizer(model_cfg),
-        callbacks=[JsonlLoggerCallback(log_file_path=cfg.train.train_args.logging_dir)],
+
+        # Patience is in EVAL events, so 20 x eval_steps of no improvement.
+        callbacks=[
+            JsonlLoggerCallback(log_file_path=cfg.train.train_args.logging_dir),
+            EarlyStoppingCallback(
+                early_stopping_patience=int(
+                    OmegaConf.select(cfg, "train.early_stopping_patience",
+                                     default=20)),
+                early_stopping_threshold=float(
+                    OmegaConf.select(cfg, "train.early_stopping_threshold",
+                                     default=0.0)),
+            ),
+        ],
     )
 
     trainer.train(resume_from_checkpoint=get_last_checkpoint(train_args.output_dir))

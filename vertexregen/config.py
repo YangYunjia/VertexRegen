@@ -14,6 +14,10 @@ class ModelConfig:
     pos_token_offset: int = 5
     max_seq_length: int = 8192
     attn_implementation: str = "flash_attention_2"
+    # Architecture overrides (hidden_size / num_hidden_layers / ...). 
+    # When set, the model is built from config rather than from pretrained weights
+    overrides: dict = None
+    from_scratch: bool = False
 
 
 @dataclass

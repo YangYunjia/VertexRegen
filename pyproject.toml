@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vertexregen"
+version = "0.0.1"
+description = "optShapeGen fork of VertexRegen (training code + bracket configs)"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["vertexregen*"]

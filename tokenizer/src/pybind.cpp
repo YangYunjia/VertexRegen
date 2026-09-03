@@ -26,7 +26,8 @@ PYBIND11_MODULE(_vertexregen_tokenizer_pybind, m)
         py::arg("no_placement") = false,
         py::arg("sharp_angle_threshold") = -1,
         py::arg("strict") = false,
-        py::arg("record_full_info") = false);
+        py::arg("record_full_info") = false,
+        py::arg("pinned_vertices") = std::vector<int>());
 
     m.def(
         "vertex_split",
@@ -69,6 +70,7 @@ PYBIND11_MODULE(_vertexregen_tokenizer_pybind, m)
         .def_readonly("cost_uncomputable", &Stats::cost_uncomputable)
         .def_readonly("placement_uncomputable", &Stats::placement_uncomputable)
         .def_readonly("num_sharp_edges", &Stats::num_sharp_edges)
+        .def_readonly("num_pinned", &Stats::num_pinned)
         .def_readonly("collapse_sequence", &Stats::collapse_sequence);
 
 #ifdef VERSION_INFO

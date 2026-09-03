@@ -9,7 +9,7 @@ from ._vertexregen_tokenizer_pybind import (
     CollapseInfo,
     Stats,
 )
-from .collapse import quantized_edge_collapse
+from .collapse import CollapseError, CollapseResult, quantized_edge_collapse
 from .tokenize import tokenize_mesh
 
 __all__ = [
@@ -20,6 +20,8 @@ __all__ = [
     "PolygonSoup",
     "CollapseInfo",
     "Stats",
+    "CollapseResult",
+    "CollapseError",
     "quantized_edge_collapse",
     "tokenize_mesh",
 ]

@@ -36,6 +36,7 @@ class Stats:
     cost_uncomputable: int
     placement_uncomputable: int
     num_sharp_edges: int
+    num_pinned: int
     collapse_sequence: List[CollapseInfo]
 
 
@@ -48,6 +49,7 @@ def edge_collapse_with_record(
     sharp_angle_threshold: float = -1,
     strict: bool = False,
     record_full_info: bool = False,
+    pinned_vertices: Optional[List[int]] = None,
 ) -> Stats: ...
 
 def vertex_split(
@@ -58,3 +60,26 @@ def vertex_split(
     v_r: Optional[int],
     v_t: Sequence[float],  # expected length 3
 ) -> Optional[PolygonSoup]: ...
+
+class CollapseError(Exception):
+    reason: str
+    def __init__(self, reason: str) -> None: ...
+
+class CollapseResult(Tuple[
+    NDArray[np.int64],
+    NDArray[np.int64],
+    NDArray[np.int64],
+    NDArray[np.int64],
+    NDArray[np.int64],
+    list,
+]): ...
+
+def quantized_edge_collapse(
+    vertices: NDArray[np.float64],
+    faces: NDArray[np.int64],
+    num_pos_tokens: int,
+    *,
+    pinned_vertices: Optional[Sequence[int]] = None,
+    target_number_of_vertices: int = 3,
+    target_number_of_triangles: int = 1,
+) -> CollapseResult: ...

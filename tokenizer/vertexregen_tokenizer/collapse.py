@@ -1,5 +1,6 @@
 import numpy as np
 from collections import namedtuple
+from typing import Optional, Sequence
 
 from ._vertexregen_tokenizer_pybind import edge_collapse_with_record, vertex_split
 from .utils import normalize_vertices, quantize_points, sort_quantized_mesh
@@ -18,23 +19,54 @@ CollapseResult = namedtuple(
 )
 
 
-def quantized_edge_collapse(vertices, faces, num_pos_tokens):
-    vertices = np.array(vertices)
-    vertices = normalize_vertices(vertices)
-    quantized_vertices = quantize_points(vertices, num_pos_tokens)
+class CollapseError(Exception):
+    """Raised when quantised edge collapse or record derivation fails."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def quantized_edge_collapse(
+    vertices,
+    faces,
+    num_pos_tokens,
+    *,
+    pinned_vertices: Optional[Sequence[int]] = None,
+    target_number_of_vertices: int = 3,
+    target_number_of_triangles: int = 1,
+) -> CollapseResult:
+    """Run quantised QEM edge collapse and derive the vertex-split record.
+
+    With default stop targets (3 vertices / 1 triangle) and no pins, behaviour
+    matches upstream VertexRegen. Pass ``pinned_vertices`` and explicit stop
+    counts to collapse to a seeded base mesh instead of the topological floor.
+
+    Raises ``CollapseError`` on failure; inspect ``exc.reason`` for the cause
+    (e.g. ``"invalid_input"``, ``"pins_unresolved"``).
+    """
+    quantized_vertices = quantize_points(
+        normalize_vertices(np.array(vertices)), num_pos_tokens
+    )
     faces = np.array(faces)
+    pinned = list(pinned_vertices or [])
+
     stats = edge_collapse_with_record(
         quantized_vertices,
         faces,
-        target_number_of_vertices=3,
-        target_number_of_triangles=1,
-        no_placement=True,  # Do not generate new vertex positions
+        target_number_of_vertices=target_number_of_vertices,
+        target_number_of_triangles=target_number_of_triangles,
+        no_placement=True,  # survivor snaps to an endpoint: no new coords
         sharp_angle_threshold=-1,
         strict=True,
         record_full_info=True,
+        pinned_vertices=pinned,
     )
+
     if not stats.is_valid:
-        return None
+        raise CollapseError("invalid_input")
+    if pinned and int(stats.num_pinned) != len(pinned):
+        raise CollapseError("pins_unresolved")
 
     vertices = np.array(stats.cleaned_mesh.vertices).astype(int)
     faces = np.array(stats.cleaned_mesh.faces).astype(int)
@@ -49,7 +81,7 @@ def quantized_edge_collapse(vertices, faces, num_pos_tokens):
         v_t = vertex_map.get(v_t, -1)
         v_placement = vertex_map.get(v_placement, -1)
         if v_s == -1 or v_t == -1 or v_placement == -1:
-            raise RuntimeError("Vertex mapping failed during collapse recording")
+            raise CollapseError("vertex_mapping_failed")
         v_l = item.v_l_p
         if v_l is not None:
             v_l = tuple(v_l.astype(int))
@@ -63,26 +95,28 @@ def quantized_edge_collapse(vertices, faces, num_pos_tokens):
         else:
             v_r = -1
         if v_l == -1 and v_r == -1:
-            raise RuntimeError("Both v_l and v_r are invalid during collapse recording")
+            raise CollapseError("both_wings_nil")
         if v_placement == v_t:
             v_l, v_r = v_r, v_l
             v_s, v_t = v_t, v_s
         collapse_info.append([v_s, v_l, v_r, v_t])
-        _cur_vertices = np.array(item.collapsed_mesh.vertices).astype(int)
-        _cur_faces = np.array(item.collapsed_mesh.faces).astype(int)
-        result_seq.append((_cur_vertices, _cur_faces))
+        result_seq.append(
+            (
+                np.array(item.collapsed_mesh.vertices).astype(int),
+                np.array(item.collapsed_mesh.faces).astype(int),
+            )
+        )
 
     collapse_info = np.array(collapse_info[::-1]).astype(int)
     result_seq = result_seq[::-1]
     init_vertices, init_faces = result_seq[0]
-    vsplit_result_seq = result_seq[1:]
     return CollapseResult(
         init_vertices=init_vertices,
         init_faces=init_faces,
         vsplit_seq=collapse_info,
         vertices=vertices,
         faces=faces,
-        vsplit_result_seq=vsplit_result_seq,
+        vsplit_result_seq=result_seq[1:],
     )
 
 
@@ -174,7 +208,7 @@ def validate_vertex_split_sequence(info: CollapseResult):
             result = vertex_split(curr_vertices, curr_faces, v_s_i, v_l_i, v_r_i, v_t_p)
             if result is None:
                 return False
-        except RuntimeError as ex:
+        except RuntimeError:
             return False
         curr_vertices = np.array(result.vertices).astype(int)
         curr_faces = np.array(result.faces).astype(int)

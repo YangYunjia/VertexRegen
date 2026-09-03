@@ -1,10 +1,25 @@
 import argparse
 import datasets
 import numpy as np
-from vertexregen_tokenizer import quantized_edge_collapse
+from vertexregen_tokenizer import CollapseError, quantized_edge_collapse
 from vertexregen_tokenizer.collapse import validate_vertex_split_sequence
 from vertexregen.data import load_dataset
 from vertexregen.decode import cleanup_mesh
+
+# Quantised seed-mesh vertices (Nx3). Carried through collapse for downstream
+# comparison with ``init_vertices`` and as an optional coordinate-token prefix.
+SEED_MESH_KEY = "seed_mesh_q"
+
+
+def _has_seed_mesh(examples_or_columns):
+    keys = (
+        examples_or_columns
+        if isinstance(examples_or_columns, (list, set, tuple))
+        else list(examples_or_columns.keys())
+        if hasattr(examples_or_columns, "keys")
+        else examples_or_columns
+    )
+    return SEED_MESH_KEY in keys
 
 
 def create_vertex_split_dataset(examples, no_validation=False, num_pos_tokens=128):
@@ -16,11 +31,18 @@ def create_vertex_split_dataset(examples, no_validation=False, num_pos_tokens=12
         "init_faces": [],
         "vsplit_seq": [],
     }
-    for uid, vertices, faces in zip(
-        examples["uid"], examples["vertices"], examples["faces"]
+    has_seed = _has_seed_mesh(examples)
+    if has_seed:
+        results[SEED_MESH_KEY] = []
+    seed_iter = (
+        examples[SEED_MESH_KEY] if has_seed else [None] * len(examples["uid"])
+    )
+    for uid, vertices, faces, seed_q in zip(
+        examples["uid"], examples["vertices"], examples["faces"], seed_iter
     ):
-        stats = quantized_edge_collapse(vertices, faces, num_pos_tokens=num_pos_tokens)
-        if stats is None:
+        try:
+            stats = quantized_edge_collapse(vertices, faces, num_pos_tokens=num_pos_tokens)
+        except CollapseError:
             continue
         if not no_validation:
             valid = validate_vertex_split_sequence(stats)
@@ -43,11 +65,19 @@ def create_vertex_split_dataset(examples, no_validation=False, num_pos_tokens=12
         )
         results["init_faces"].append(init_faces)
         results["vsplit_seq"].append(np.array(stats.vsplit_seq).astype(int))
+        if has_seed:
+            results[SEED_MESH_KEY].append(np.array(seed_q).astype(int))
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "HF raw (uid/vertices/faces[/seed_mesh_q]) -> vsplit dataset. "
+            "For mesh npz with seed_verts (pinned collapse), prefer "
+            "scripts/preprocess_vsplit_dataset.py instead."
+        )
+    )
     parser.add_argument(
         "-i",
         "--input",
@@ -91,6 +121,7 @@ def main():
     args = parser.parse_args()
 
     data = load_dataset(args.input)
+    has_seed = _has_seed_mesh(data["train"].column_names)
     result = data.map(
         create_vertex_split_dataset,
         batched=True,
@@ -118,7 +149,16 @@ def main():
                 ),  # faces of simplified mesh M_0
                 "vsplit_seq": datasets.Sequence(
                     datasets.Sequence(datasets.Value("int32"), length=4)
-                ),  # vertex split sequence to reconstruct original mesh where v_s, v_l, v_r, v_t are vertex indices w.r.t. original mesh
+                ),
+                **(
+                    {
+                        SEED_MESH_KEY: datasets.Sequence(
+                            datasets.Sequence(datasets.Value("int32"), length=3)
+                        )
+                    }
+                    if has_seed
+                    else {}
+                ),
             }
         ),
     )

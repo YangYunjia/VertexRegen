@@ -35,6 +35,7 @@ def quantized_edge_collapse(
     pinned_vertices: Optional[Sequence[int]] = None,
     target_number_of_vertices: int = 3,
     target_number_of_triangles: int = 1,
+    quantized_vertices: Optional[np.ndarray] = None,
 ) -> CollapseResult:
     """Run quantised QEM edge collapse and derive the vertex-split record.
 
@@ -44,10 +45,23 @@ def quantized_edge_collapse(
 
     Raises ``CollapseError`` on failure; inspect ``exc.reason`` for the cause
     (e.g. ``"invalid_input"``, ``"pins_unresolved"``).
+
+    ``quantized_vertices`` overrides the internal quantisation. Upstream always
+    normalises each mesh by its OWN bounding box. Pass a constant quantizition
+    grid instead to make the frame available at inference and identical across
+    samples.
+
+    Everything after this point operates on integer coordinates, so supplying
+    them directly changes nothing else about the procedure.
     """
-    quantized_vertices = quantize_points(
-        normalize_vertices(np.array(vertices)), num_pos_tokens
-    )
+    if quantized_vertices is None:
+        quantized_vertices = quantize_points(
+            normalize_vertices(np.array(vertices)), num_pos_tokens
+        )
+    else:
+        quantized_vertices = np.asarray(quantized_vertices)
+        if quantized_vertices.shape != (len(np.asarray(vertices)), 3):
+            raise CollapseError("invalid_input")
     faces = np.array(faces)
     pinned = list(pinned_vertices or [])
 

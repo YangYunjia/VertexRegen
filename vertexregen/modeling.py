@@ -6,12 +6,17 @@ class VertexRegenConfig(OPTConfig):
     model_type = "vertexregen"
 
     def __init__(
-        self, num_pos_tokens=128, nil_token_id=4, pos_token_offset=5, **kwargs
+        self, num_pos_tokens=128, nil_token_id=4, pos_token_offset=5,
+        relative_vt=False, delta_token_offset=0, **kwargs
     ):
         super().__init__(**kwargs)
         self.num_pos_tokens = num_pos_tokens
         self.nil_token_id = nil_token_id
         self.pos_token_offset = pos_token_offset
+        # Carried on the HF config, not just ModelConfig, because SequenceDecoder
+        # is constructed from the saved model config at generation time.
+        self.relative_vt = relative_vt
+        self.delta_token_offset = delta_token_offset
 
 
 class VertexRegenModel(OPTForCausalLM):
@@ -32,6 +37,8 @@ def get_model(model_cfg: ModelConfig):
         sep_token_id=model_cfg.sep_token_id,
         nil_token_id=model_cfg.nil_token_id,
         pos_token_offset=model_cfg.pos_token_offset,
+        relative_vt=getattr(model_cfg, "relative_vt", False),
+        delta_token_offset=getattr(model_cfg, "delta_token_offset", 0),
         max_position_embeddings=model_cfg.max_seq_length,
         do_layer_norm_before=True,
     )

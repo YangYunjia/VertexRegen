@@ -25,6 +25,15 @@ class SequenceDecoder:
         self.all_pos_tokens = np.arange(
             config.pos_token_offset, config.pos_token_offset + config.num_pos_tokens
         )
+        # Relative-v_t variant: v_t is emitted as (v_t - v_s) in its own token
+        # band, so the target is bounded by the parent rather than by the cube.
+        self.relative_vt = bool(getattr(config, "relative_vt", False))
+        self.num_pos_tokens = int(config.num_pos_tokens)
+        self.delta_token_offset = int(getattr(config, "delta_token_offset", 0) or 0)
+        self.n_delta = 2 * self.num_pos_tokens - 1
+        self.all_delta_tokens = np.arange(
+            self.delta_token_offset, self.delta_token_offset + self.n_delta
+        )
         self.failfast = failfast
         self._reset_state()
 
@@ -190,7 +199,9 @@ class SequenceDecoder:
                 if len(prefix) == 0 and not self.vl_is_nil:
                     valid_tokens = np.append(valid_tokens, self.nil_token_id)
             case "EXPECT_VT":
-                valid_tokens = self.all_pos_tokens
+                valid_tokens = (
+                    self.all_delta_tokens if self.relative_vt else self.all_pos_tokens
+                )
             case _:
                 raise ValueError(f"Unknown state: {self.state}")
         return valid_tokens
@@ -229,7 +240,12 @@ class SequenceDecoder:
         self.state = "EXPECT_VT"
 
     def _handle_vt(self):
-        val = self.consume(3) - self.pos_token_offset
+        if self.relative_vt:
+            # band is centred on zero delta; add back the split vertex
+            d = self.consume(3) - self.delta_token_offset - (self.num_pos_tokens - 1)
+            val = np.asarray(self.current_structure["v_s"]) + d
+        else:
+            val = self.consume(3) - self.pos_token_offset
         self.current_structure["v_t"] = val
 
         v_s_p = self.current_structure["v_s"]

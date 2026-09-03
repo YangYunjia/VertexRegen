@@ -14,9 +14,18 @@ def tokenize_mesh(
     sep_token_id=3,
     nil_token_id=4,
     pos_token_offset=5,
+    # Relative-v_t-> v_t becomes (v_t - v_s).
+    # The delta band is 2*num_pos_tokens-1 wide so it can represent every
+    # difference two in-range coordinates can produce -- no clipping, ever, which
+    # matters because a clipped delta silently breaks the replay.
+    relative_vt=False,
+    delta_token_offset=None,
+    num_pos_tokens=None,
 ):
     init_vertices, init_faces = sort_quantized_mesh(init_vertices, init_faces)
     soup = init_vertices[init_faces].flatten() + pos_token_offset
+    if relative_vt and (delta_token_offset is None or num_pos_tokens is None):
+        raise ValueError("relative_vt needs delta_token_offset and num_pos_tokens")
     vsplit_tokens = []
     for v_s, v_l, v_r, v_t in vsplit_seq:
         v_s_p = (all_vertices[v_s] + pos_token_offset).tolist()
@@ -30,7 +39,12 @@ def tokenize_mesh(
             if v_r != -1
             else [nil_token_id]
         )
-        v_t_p = (all_vertices[v_t] + pos_token_offset).tolist()
+        if relative_vt:
+            # zero delta sits at the middle of the band
+            d = np.asarray(all_vertices[v_t]) - np.asarray(all_vertices[v_s])
+            v_t_p = (d + (num_pos_tokens - 1) + delta_token_offset).tolist()
+        else:
+            v_t_p = (all_vertices[v_t] + pos_token_offset).tolist()
         vsplit_tokens.extend([*v_s_p, *v_l_p, *v_r_p, *v_t_p])
     tokens = (
         [bos_token_id] + soup.tolist() + [sep_token_id] + vsplit_tokens + [eos_token_id]

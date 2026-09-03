@@ -18,12 +18,20 @@ class ModelConfig:
     # When set, the model is built from config rather than from pretrained weights
     overrides: dict = None
     from_scratch: bool = False
+    # Relative-v_t variant: emit (v_t - v_s) in a dedicated band of
+    # 2*num_pos_tokens-1 ids starting at delta_token_offset. 
+    relative_vt: bool = False
+    delta_token_offset: int = 0
 
 
 @dataclass
 class DataConfig:
     path: str
     num_pos_tokens: int
+    # When True, expect ``seed_mesh_q`` in the dataset and prepend it at train /
+    # eval time (mask prefix + base soup). When False, run upstream's
+    # unconditional layout and require the column to be absent.
+    use_seed_mesh: bool = False
     pad_to_multiple_of: int = 32
     padding_side: str = "right"
     random_scale: bool = True

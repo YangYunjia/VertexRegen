@@ -9,6 +9,27 @@ from vertexregen_tokenizer import tokenize_mesh
 from vertexregen_tokenizer.utils import quantize_points, normalize_vertices
 from .config import DataConfig, ModelConfig
 
+SEED_MESH_KEY = "seed_mesh_q"
+
+
+def validate_seed_mesh_dataset(data, use_seed_mesh: bool, path: str) -> None:
+    """Assert dataset columns match ``data.use_seed_mesh`` before training."""
+    for split in data:
+        columns = set(data[split].column_names)
+        has_col = SEED_MESH_KEY in columns
+        if use_seed_mesh and not has_col:
+            raise ValueError(
+                f"Dataset {path!r} split {split!r} is missing {SEED_MESH_KEY!r} "
+                f"but data.use_seed_mesh=True; build with "
+                f"scripts/preprocess_vsplit_dataset.py (pinned seed)."
+            )
+        if not use_seed_mesh and has_col:
+            raise ValueError(
+                f"Dataset {path!r} split {split!r} has {SEED_MESH_KEY!r} "
+                f"but data.use_seed_mesh=False; drop the column or set "
+                f"use_seed_mesh=True."
+            )
+
 
 def pad_tokens(
     all_input_ids,
@@ -50,9 +71,16 @@ class VertexRegenCollator:
         self.max_seq_length = model_cfg.max_seq_length
         self.pad_to_multiple_of = data_cfg.pad_to_multiple_of
         self.padding_side = data_cfg.padding_side
+        self.relative_vt = getattr(model_cfg, "relative_vt", False)
+        self.delta_token_offset = getattr(model_cfg, "delta_token_offset", 0)
+        self.num_pos_tokens = model_cfg.num_pos_tokens
+        self.use_seed_mesh = data_cfg.use_seed_mesh
 
     def __call__(self, examples):
         all_input_ids = []
+        prefix_lens = []
+        base_lens = []
+        mask_soup = []
         for example in examples:
             tokens = tokenize_mesh(
                 all_vertices=example["vertices"],
@@ -64,7 +92,29 @@ class VertexRegenCollator:
                 sep_token_id=self.sep_token_id,
                 nil_token_id=self.nil_token_id,
                 pos_token_offset=self.pos_token_offset,
+                relative_vt=self.relative_vt,
+                delta_token_offset=self.delta_token_offset,
+                num_pos_tokens=self.num_pos_tokens,
             )
+            # Optional seed-mesh coordinate prefix (``data.use_seed_mesh``):
+            #   [BOS] <seed verts> [SEP] <soup> [SEP] <vsplits> [EOS]
+            # Labels mask the prefix and base soup (both prefilled at generation).
+            if self.use_seed_mesh:
+                seed = example[SEED_MESH_KEY]
+                seed_tokens = (
+                    np.asarray(seed, dtype=np.int64).reshape(-1)
+                    + self.pos_token_offset
+                ).tolist()
+                prefix = [tokens[0]] + seed_tokens + [self.sep_token_id]
+                tokens = prefix + tokens[1:]
+                prefix_lens.append(len(prefix))
+                mask_soup.append(True)
+            else:
+                prefix_lens.append(0)
+                mask_soup.append(False)
+            # Triangle soup is 9 tokens per base face, then the <sep> that ends
+            # the base-mesh region.
+            base_lens.append(9 * len(np.asarray(example["init_faces"])) + 1)
             all_input_ids.append(tokens)
         padded_input_ids, attention_mask = pad_tokens(
             all_input_ids,
@@ -75,6 +125,17 @@ class VertexRegenCollator:
         )
         labels = padded_input_ids.copy()
         labels[labels == self.pad_token_id] = -100
+        # The condition is given, not predicted: excluding it keeps the reported
+        # loss comparable to the unconditional run and to our other arms.
+        for i, n in enumerate(prefix_lens):
+            if n and self.padding_side == "right":
+                labels[i, :n] = -100
+        if self.padding_side == "right":
+            for i, (n, b, drop_soup) in enumerate(
+                zip(prefix_lens, base_lens, mask_soup)
+            ):
+                if drop_soup:
+                    labels[i, n : n + b] = -100
         return {
             "input_ids": torch.as_tensor(padded_input_ids, dtype=torch.long),
             "attention_mask": torch.as_tensor(attention_mask, dtype=torch.long),
@@ -186,6 +247,55 @@ def random_rotate(vertices, info_dict=None):
     return out
 
 
+def augment_mesh_with_seed(vertices, seed_coords, data_cfg: DataConfig):
+    """augment_mesh, with quantised seed verts carried through identically.
+
+    The seed is the generation start state / comparison target, so it must
+    undergo the same scale / shift / rotate as the mesh. Normalised with the
+    *mesh's* centre and scale so both stay in a common frame.
+    """
+    num_pos_tokens = data_cfg.num_pos_tokens
+    v = np.asarray(vertices, dtype=np.float64)
+    p = np.asarray(seed_coords, dtype=np.float64)
+
+    vmin, vmax = v.min(0), v.max(0)
+    center = (vmin + vmax) / 2
+    scale = 2.0 / (vmax - vmin).max()
+    nv = (v - center) * scale
+    np_ = (p - center) * scale
+
+    has_aug = False
+    if data_cfg.random_scale:
+        info = {}
+        nv = random_scale(nv, min_scale=1.0, max_scale=data_cfg.random_scale_max,
+                          info_dict=info)
+        np_ = np_ * info["scales"]
+        has_aug = True
+    if data_cfg.random_shift:
+        info = {}
+        nv = random_shift(nv, min_shift=data_cfg.random_shift_min,
+                          max_shift=data_cfg.random_shift_max, info_dict=info)
+        np_ = np_ + info["shifts"]
+        has_aug = True
+    if data_cfg.random_rotate:
+        info = {}
+        nv = random_rotate(nv, info_dict=info)
+        k = info["rotation"] // 90
+        if k:
+            x, z = np_[:, 0].copy(), np_[:, 2].copy()
+            if k == 1:
+                np_[:, 0], np_[:, 2] = z, -x
+            elif k == 2:
+                np_[:, 0], np_[:, 2] = -x, -z
+            elif k == 3:
+                np_[:, 0], np_[:, 2] = -z, x
+        has_aug = True
+
+    if has_aug:
+        vertices = quantize_points(nv, num_pos_tokens)
+    return vertices, quantize_points(np_, num_pos_tokens)
+
+
 def augment_mesh(vertices, data_cfg: DataConfig, return_info=False):
     num_pos_tokens = data_cfg.num_pos_tokens
     normalized_vertices = normalize_vertices(vertices)
@@ -232,32 +342,49 @@ def transform_mesh(examples, is_train, data_cfg: DataConfig):
     result_init_vertices = []
     result_init_faces = []
     result_vsplit_seq = []
-    for vertices, faces, init_vertices_ref, init_faces, vsplit_seq in zip(
+    use_seed = data_cfg.use_seed_mesh
+    result_seed = [] if use_seed else None
+    seed_iter = (
+        examples[SEED_MESH_KEY] if use_seed else [None] * len(examples["vertices"])
+    )
+    for vertices, faces, init_vertices_ref, init_faces, vsplit_seq, seed_q in zip(
         examples["vertices"],
         examples["faces"],
         examples["init_vertices_ref"],
         examples["init_faces"],
         examples["vsplit_seq"],
+        seed_iter,
     ):
         vertices = np.array(vertices, dtype=int)
         faces = np.array(faces, dtype=int)
         init_vertices_ref = np.array(init_vertices_ref, dtype=int)
         init_faces = np.array(init_faces, dtype=int)
         vsplit_seq = np.array(vsplit_seq, dtype=int)
+        if use_seed:
+            seed_q = np.array(seed_q, dtype=int)
         if is_train:
-            # Perform data augmentation
-            vertices = augment_mesh(vertices, data_cfg)
+            if use_seed:
+                vertices, seed_q = augment_mesh_with_seed(
+                    vertices, seed_q, data_cfg
+                )
+            else:
+                vertices = augment_mesh(vertices, data_cfg)
         init_vertices = vertices[init_vertices_ref]
         result_vertices.append(vertices)
         result_init_vertices.append(init_vertices)
         result_init_faces.append(init_faces)
         result_vsplit_seq.append(vsplit_seq)
-    return {
+        if use_seed:
+            result_seed.append(seed_q)
+    out = {
         "vertices": result_vertices,
         "init_vertices": result_init_vertices,
         "init_faces": result_init_faces,
         "vsplit_seq": result_vsplit_seq,
     }
+    if use_seed:
+        out[SEED_MESH_KEY] = result_seed
+    return out
 
 
 def load_dataset(path):
@@ -269,6 +396,7 @@ def load_dataset(path):
 
 def get_dataset(data_cfg: DataConfig):
     data = load_dataset(data_cfg.path)
+    validate_seed_mesh_dataset(data, data_cfg.use_seed_mesh, data_cfg.path)
     train_set = data["train"]
     test_set = data["test"]
     if data_cfg.overfit:

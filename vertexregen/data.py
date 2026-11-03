@@ -54,8 +54,7 @@ def pad_tokens(
             attention_mask[i, -len(input_ids) :] = 1
 
     if max_seq_length is not None and max_len > max_seq_length:
-        padded_input_ids = padded_input_ids[:, :max_seq_length]
-        attention_mask = attention_mask[:, :max_seq_length]
+        raise ValueError(f'{max_len} tokens exceed context {max_seq_length}; truncation is disabled')
 
     return padded_input_ids, attention_mask
 
@@ -76,48 +75,52 @@ class VertexRegenCollator:
         self.num_pos_tokens = model_cfg.num_pos_tokens
         self.use_seed_mesh = data_cfg.use_seed_mesh
 
+    def encode_example(self, example):
+        """Native tokens and supervision boundary; cached tokens stay exact."""
+        if 'input_ids' in example:
+            return (np.asarray(example['input_ids'], np.int64),
+                    int(example['loss_start']), int(example['base_end']))
+        tokens = tokenize_mesh(
+            all_vertices=example["vertices"],
+            init_vertices=example["init_vertices"],
+            init_faces=example["init_faces"],
+            vsplit_seq=example["vsplit_seq"],
+            bos_token_id=self.bos_token_id,
+            eos_token_id=self.eos_token_id,
+            sep_token_id=self.sep_token_id,
+            nil_token_id=self.nil_token_id,
+            pos_token_offset=self.pos_token_offset,
+            relative_vt=self.relative_vt,
+            delta_token_offset=self.delta_token_offset,
+            num_pos_tokens=self.num_pos_tokens,
+        )
+        # Optional seed-mesh coordinate prefix (``data.use_seed_mesh``):
+        #   [BOS] <seed verts> [SEP] <soup> [SEP] <vsplits> [EOS]
+        base_end = 2 + 9 * len(example['init_faces'])
+        loss_start = 1  # BOS is given; the base mesh is predicted by default.
+        if self.use_seed_mesh:
+            seed = np.asarray(example[SEED_MESH_KEY], np.int64)
+            prefix = [tokens[0], *(seed.reshape(-1) + self.pos_token_offset).tolist(), self.sep_token_id]
+            tokens = prefix + tokens[1:]
+            base_end += len(prefix) - 1
+            loss_start = base_end
+        # OptShapeGen reimplementation of VertexRegen paper Sec. 3.3:
+        # https://arxiv.org/html/2508.09062v1#S3.SS3
+        # The public upstream release omits point-cloud conditioning. Reserve
+        # prefix positions for projected point-cloud embeddings and mask their loss;
+        # FeatureConditionedModel in methods/vertexregen/model.py injects embeddings.
+        if 'condition_features' in example:
+            count = len(example['condition_features'])
+            tokens = [self.pad_token_id] * count + tokens
+            base_end += count
+            loss_start += count
+        return np.asarray(tokens, np.int64), loss_start, base_end
+
     def __call__(self, examples):
-        all_input_ids = []
-        prefix_lens = []
-        base_lens = []
-        mask_soup = []
-        for example in examples:
-            tokens = tokenize_mesh(
-                all_vertices=example["vertices"],
-                init_vertices=example["init_vertices"],
-                init_faces=example["init_faces"],
-                vsplit_seq=example["vsplit_seq"],
-                bos_token_id=self.bos_token_id,
-                eos_token_id=self.eos_token_id,
-                sep_token_id=self.sep_token_id,
-                nil_token_id=self.nil_token_id,
-                pos_token_offset=self.pos_token_offset,
-                relative_vt=self.relative_vt,
-                delta_token_offset=self.delta_token_offset,
-                num_pos_tokens=self.num_pos_tokens,
-            )
-            # Optional seed-mesh coordinate prefix (``data.use_seed_mesh``):
-            #   [BOS] <seed verts> [SEP] <soup> [SEP] <vsplits> [EOS]
-            # Labels mask the prefix and base soup (both prefilled at generation).
-            if self.use_seed_mesh:
-                seed = example[SEED_MESH_KEY]
-                seed_tokens = (
-                    np.asarray(seed, dtype=np.int64).reshape(-1)
-                    + self.pos_token_offset
-                ).tolist()
-                prefix = [tokens[0]] + seed_tokens + [self.sep_token_id]
-                tokens = prefix + tokens[1:]
-                prefix_lens.append(len(prefix))
-                mask_soup.append(True)
-            else:
-                prefix_lens.append(0)
-                mask_soup.append(False)
-            # Triangle soup is 9 tokens per base face, then the <sep> that ends
-            # the base-mesh region.
-            base_lens.append(9 * len(np.asarray(example["init_faces"])) + 1)
-            all_input_ids.append(tokens)
+        """Tokenize examples and batch their inputs, masked labels, and optional features."""
+        sequences = [self.encode_example(example) for example in examples]
         padded_input_ids, attention_mask = pad_tokens(
-            all_input_ids,
+            [tokens for tokens, _, _ in sequences],
             pad_token_id=self.pad_token_id,
             padding_side=self.padding_side,
             max_seq_length=self.max_seq_length,
@@ -125,22 +128,18 @@ class VertexRegenCollator:
         )
         labels = padded_input_ids.copy()
         labels[labels == self.pad_token_id] = -100
-        # The condition is given, not predicted: excluding it keeps the reported
-        # loss comparable to the unconditional run and to our other arms.
-        for i, n in enumerate(prefix_lens):
-            if n and self.padding_side == "right":
-                labels[i, :n] = -100
-        if self.padding_side == "right":
-            for i, (n, b, drop_soup) in enumerate(
-                zip(prefix_lens, base_lens, mask_soup)
-            ):
-                if drop_soup:
-                    labels[i, n : n + b] = -100
-        return {
+        for i, (tokens, start, _) in enumerate(sequences):
+            offset = 0 if self.padding_side == 'right' else padded_input_ids.shape[1] - len(tokens)
+            labels[i, offset:offset + start] = -100
+        batch = {
             "input_ids": torch.as_tensor(padded_input_ids, dtype=torch.long),
             "attention_mask": torch.as_tensor(attention_mask, dtype=torch.long),
             "labels": torch.as_tensor(labels, dtype=torch.long),
         }
+        if 'condition_features' in examples[0]:
+            batch['condition_features'] = torch.as_tensor(
+                np.stack([example['condition_features'] for example in examples]))
+        return batch
 
 
 class VertexRegenTokenizer(PreTrainedTokenizerBase):
@@ -338,6 +337,15 @@ def has_duplicate_vertices(vertices):
 
 
 def transform_mesh(examples, is_train, data_cfg: DataConfig):
+    # Migrated caches may already contain final tokens and supervision boundaries.
+    # They still pass through the same upstream transform and collator.
+    """Format native rows and reconstruct M0 vertices, optionally normalizing training geometry."""
+    if 'input_ids' in examples:
+        out = dict(examples)
+        out['input_ids'] = [np.asarray(ids, np.int64) for ids in examples['input_ids']]
+        if 'condition_features' in out:
+            out['condition_features'] = [np.asarray(value, np.float16) for value in out['condition_features']]
+        return out
     result_vertices = []
     result_init_vertices = []
     result_init_faces = []
@@ -362,7 +370,7 @@ def transform_mesh(examples, is_train, data_cfg: DataConfig):
         vsplit_seq = np.array(vsplit_seq, dtype=int)
         if use_seed:
             seed_q = np.array(seed_q, dtype=int)
-        if is_train:
+        if is_train and data_cfg.normalize:
             if use_seed:
                 vertices, seed_q = augment_mesh_with_seed(
                     vertices, seed_q, data_cfg
@@ -376,7 +384,7 @@ def transform_mesh(examples, is_train, data_cfg: DataConfig):
         result_vsplit_seq.append(vsplit_seq)
         if use_seed:
             result_seed.append(seed_q)
-    out = {
+    out = {**examples,
         "vertices": result_vertices,
         "init_vertices": result_init_vertices,
         "init_faces": result_init_faces,
@@ -384,6 +392,8 @@ def transform_mesh(examples, is_train, data_cfg: DataConfig):
     }
     if use_seed:
         out[SEED_MESH_KEY] = result_seed
+    if 'condition_features' in out:
+        out['condition_features'] = [np.asarray(value, np.float16) for value in out['condition_features']]
     return out
 
 
@@ -395,10 +405,14 @@ def load_dataset(path):
 
 
 def get_dataset(data_cfg: DataConfig):
+    """Select train/validation splits and attach the native row transform."""
     data = load_dataset(data_cfg.path)
-    validate_seed_mesh_dataset(data, data_cfg.use_seed_mesh, data_cfg.path)
+    if 'input_ids' not in data['train'].column_names:
+        validate_seed_mesh_dataset(data, data_cfg.use_seed_mesh, data_cfg.path)
+    if not data_cfg.normalize and any((data_cfg.random_scale, data_cfg.random_shift, data_cfg.random_rotate)):
+        raise ValueError('normalize=False requires random_scale/shift/rotate=False to preserve the prepared grid')
     train_set = data["train"]
-    test_set = data["test"]
+    test_set = data['val'] if 'val' in data else data['test']
     if data_cfg.overfit:
         data_size = len(train_set)
         num_samples = min(data_size, 8)

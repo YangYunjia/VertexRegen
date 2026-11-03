@@ -28,6 +28,8 @@ class ModelConfig:
 class DataConfig:
     path: str
     num_pos_tokens: int
+    # False preserves the prepared integer grid while retaining row formatting.
+    normalize: bool = True
     # When True, expect ``seed_mesh_q`` in the dataset and prepend it at train /
     # eval time (mask prefix + base soup). When False, run upstream's
     # unconditional layout and require the column to be absent.
